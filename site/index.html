@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en-GB" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<meta name="theme-color" content="#f5f6f3">
+<meta name="robots" content="noindex,nofollow">
+<title>Our album</title>
+<link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Our album">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,opsz,wght@0,6..96,400;0,6..96,500;1,6..96,400;1,6..96,500&family=Hanken+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css?v=1">
+</head>
+<body>
+
+<!-- Lock screen -->
+<section id="lock" class="lock" aria-label="Unlock the album">
+  <div class="lock__inner">
+    <p class="lock__since"><span id="lockDays">0</span> days of us</p>
+    <h1 class="lock__title">Alex <span class="amp">&amp;</span> Sam</h1>
+    <p class="lock__sub">A private album for two.</p>
+    <form id="lockForm" class="lock__form" autocomplete="off">
+      <label class="sr" for="pw">Our secret word</label>
+      <input id="pw" type="password" placeholder="Our secret word" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <button type="submit" class="btn btn--solid">Open the album</button>
+    </form>
+    <section class="terms" aria-label="Terms of entry">
+      <h2 class="terms__title">Terms of entry</h2>
+      <ol id="termsList" class="terms__list"></ol>
+      <label class="terms__agree"><input type="checkbox" id="agree"> <span>I have read the terms and agree to behave.</span></label>
+    </section>
+    <p id="lockErr" class="lock__err" role="alert" hidden>Not quite. Try once more.</p>
+    <p class="lock__hint">Hint: set your own word and hint in app.js and index.html.</p>
+  </div>
+</section>
+
+<!-- Who's here -->
+<section id="who" class="lock" hidden aria-label="Choose who is using this device">
+  <div class="lock__inner">
+    <h1 class="lock__title lock__title--sm">Who's here?</h1>
+    <p class="lock__sub">So notes and comments carry the right name. This device will remember.</p>
+    <div class="who__row">
+      <button class="who__btn" data-who="one">Alex</button>
+      <button class="who__btn" data-who="two">Sam</button>
+    </div>
+  </div>
+</section>
+
+<!-- App -->
+<div id="app" hidden>
+  <header class="top">
+    <a class="mark" href="#/">Alex <span class="amp">&amp;</span> Sam</a>
+    <nav class="nav" aria-label="Pages">
+      <a href="#/" data-route="">Photos</a>
+      <a href="#/albums" data-route="albums">Albums</a>
+      <a href="#/timeline" data-route="timeline">Timeline</a>
+      <a href="#/films" data-route="films">Films</a>
+      <a href="#/favourites" data-route="favourites">Favourites</a>
+      <a href="#/hearts" data-route="hearts">Hearts</a>
+      <a href="#/us" data-route="us">Us<span id="navDot" class="dot" hidden></span></a>
+    </nav>
+    <div class="tools">
+      <button id="musicBtn" class="ic" aria-label="Play our song" aria-pressed="false" title="Our song"></button>
+      <button id="themeBtn" class="ic" aria-label="Switch between light and dark" title="Light or dark"></button>
+      <label class="btn btn--solid add">
+        <span>Add photos</span>
+        <input id="file" type="file" accept="image/*,video/*" multiple hidden>
+      </label>
+    </div>
+  </header>
+
+  <main id="view" class="view" tabindex="-1"></main>
+
+  <footer class="foot">
+    <span>Made for the two of us.</span>
+    <span id="footWho"></span>
+  </footer>
+
+  <nav class="tabs" aria-label="Pages">
+    <a href="#/" data-route=""><i data-ic="grid"></i>Photos</a>
+    <a href="#/albums" data-route="albums"><i data-ic="stack"></i>Albums</a>
+    <a href="#/timeline" data-route="timeline"><i data-ic="cal"></i>Timeline</a>
+    <a href="#/films" data-route="films"><i data-ic="film"></i>Films</a>
+    <a href="#/favourites" data-route="favourites"><i data-ic="heart"></i>Favourites</a>
+    <a href="#/us" data-route="us"><i data-ic="us"></i>Us<span id="tabDot" class="dot" hidden></span></a>
+  </nav>
+</div>
+
+<!-- Photo viewer -->
+<div id="viewer" class="viewer" hidden role="dialog" aria-modal="true" aria-label="Photo">
+  <div class="viewer__stage">
+    <button class="ic viewer__close" id="vClose" aria-label="Close"></button>
+    <button class="ic viewer__nav viewer__nav--prev" id="vPrev" aria-label="Previous"></button>
+    <div id="vMedia" class="viewer__media"></div>
+    <button class="ic viewer__nav viewer__nav--next" id="vNext" aria-label="Next"></button>
+  </div>
+  <aside class="viewer__side">
+    <p id="vCount" class="viewer__count"></p>
+    <h2 id="vCaption" class="viewer__caption"></h2>
+    <form id="vEditForm" class="viewer__edit" hidden>
+      <label for="vEditInput">Caption</label><input id="vEditInput" type="text" maxlength="200">
+      <label for="vEditDate">Date taken</label><input id="vEditDate" type="date">
+      <div class="sheet__row"><button type="button" id="vEditCancel" class="btn btn--line">Cancel</button><button class="btn btn--solid">Save</button></div>
+    </form>
+    <p id="vDate" class="viewer__date"></p>
+    <div class="viewer__acts">
+      <button id="vFav" class="btn btn--line"></button>
+      <button id="vDown" class="btn btn--line">Download</button>
+      <button id="vEdit" class="btn btn--line" hidden>Edit details</button>
+      <button id="vDel" class="btn btn--line" hidden>Delete</button>
+    </div>
+    <p id="vLoves" class="viewer__loves" hidden></p>
+    <div id="vAlbumRow" class="viewer__album" hidden><label for="vAlbum">Album</label><select id="vAlbum"></select></div>
+    <div id="vComments" class="comments"></div>
+  </aside>
+</div>
+
+<!-- Hearts arriving -->
+<div id="gift" class="gift" hidden role="dialog" aria-modal="true" aria-labelledby="giftLine">
+  <div id="giftSky" class="gift__sky" aria-hidden="true"></div>
+  <div class="gift__card">
+    <p id="giftLine" class="gift__line"></p>
+    <div id="giftNotes" class="gift__notes"></div>
+    <div class="gift__acts">
+      <button id="giftBack" class="btn btn--solid">Send some back</button>
+      <button id="giftClose" class="btn btn--line">Thank you</button>
+    </div>
+  </div>
+</div>
+
+<!-- Slideshow -->
+<div id="show" class="show" hidden role="dialog" aria-modal="true" aria-label="Slideshow">
+  <div class="show__layer" id="showA"></div>
+  <div class="show__layer" id="showB"></div>
+  <p id="showCap" class="show__cap"></p>
+  <div class="show__bar">
+    <button class="ic" id="showPrev" aria-label="Previous"></button>
+    <button class="ic" id="showPlay" aria-label="Pause"></button>
+    <button class="ic" id="showNext" aria-label="Next"></button>
+    <button class="ic" id="showClose" aria-label="Close slideshow"></button>
+  </div>
+</div>
+
+<!-- Upload caption sheet -->
+<div id="sheet" class="sheet" hidden role="dialog" aria-modal="true" aria-label="Add to album">
+  <div class="sheet__card">
+    <p id="sheetStep" class="sheet__step"></p>
+    <div id="sheetPrev" class="sheet__prev"></div>
+    <div id="sheetDup" class="sheet__dup" hidden>
+      <span id="sheetDupThumb" class="sheet__dupthumb"></span>
+      <p><strong>This looks like one already in the album.</strong> <span id="sheetDupWhen"></span></p>
+    </div>
+    <label for="cap">Caption <span class="muted">(optional)</span></label>
+    <textarea id="cap" rows="2" maxlength="200" placeholder="Where were we?"></textarea>
+    <div id="sheetAlbumRow" hidden><label for="sheetAlbum">Album <span class="muted">(optional)</span></label><select id="sheetAlbum"></select></div>
+    <div class="sheet__row">
+      <button id="sheetCancel" class="btn btn--line">Cancel</button>
+      <button id="sheetSkip" class="btn btn--solid" hidden>Skip it</button>
+      <button id="sheetAdd" class="btn btn--solid">Add to album</button>
+    </div>
+  </div>
+</div>
+
+<div id="drop" class="drop" hidden><p>Drop to add to the album</p></div>
+<div id="progress" class="progress" hidden><span id="progressName"></span><div class="progress__track"><div id="progressFill"></div></div></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<audio id="song" loop preload="none" src="song.mp3"></audio>
+<script src="app.js?v=1"></script>
+</body>
+</html>

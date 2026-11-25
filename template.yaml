@@ -1,0 +1,565 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Private photo album for two. Creates the site bucket, API, Lambda, sign-in and CloudFront.
+  Uses the EXISTING media bucket and DynamoDB table; it never creates, changes or deletes them.
+  Deploy in us-east-1.
+
+Parameters:
+  SiteUsername:
+    Type: String
+    Description: Username for the browser sign-in pop-up.
+  SitePassword:
+    Type: String
+    NoEcho: true
+    Description: Password for the browser sign-in pop-up.
+  UseDomain:
+    Type: String
+    AllowedValues: ["false", "true"]
+    Default: "false"
+    Description: Leave false to test on the cloudfront.net address. Set true at cutover to attach the domain.
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Your domain, for example album.example.com. Only used when UseDomain is true.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ARN of an ACM certificate in us-east-1 covering the domain. Only used when UseDomain is true.
+  MediaBucketName:
+    Type: String
+    Description: Existing bucket holding the photos and videos.
+  TableName:
+    Type: String
+    Description: Existing DynamoDB table (keys pk and sk) holding captions, comments and notes.
+  PersonOneEmail:
+    Type: String
+    Description: Gets a short email when person two adds something.
+  PersonTwoEmail:
+    Type: String
+    Description: Gets a short email when person one adds something.
+  EmailGapMinutes:
+    Type: Number
+    Default: 60
+    Description: At most one email per person in this many minutes.
+
+Conditions:
+  UseDomain: !Equals [!Ref UseDomain, "true"]
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # Email notices. Topic names are deliberately bland: they appear in the email footer.
+  NoticeForPersonOne:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: notice-1
+      DisplayName: Reminder
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref PersonOneEmail
+
+  NoticeForPersonTwo:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: notice-2
+      DisplayName: Reminder
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref PersonTwoEmail
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: album
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${MediaBucketName}/uploads/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${MediaBucketName}"
+              - Effect: Allow
+                Action: [s3:DeleteObject, s3:DeleteObjectVersion]
+                Resource: !Sub "arn:aws:s3:::${MediaBucketName}/uploads/*"
+              - Effect: Allow
+                Action: s3:ListBucketVersions
+                Resource: !Sub "arn:aws:s3:::${MediaBucketName}"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: [!Ref NoticeForPersonOne, !Ref NoticeForPersonTwo]
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref TableName
+          MEDIA_BUCKET: !Ref MediaBucketName
+          ORIGIN_SECRET: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+          TOPIC_ONE: !Ref NoticeForPersonOne
+          TOPIC_TWO: !Ref NoticeForPersonTwo
+          EMAIL_GAP_MINUTES: !Ref EmailGapMinutes
+      Code:
+        ZipFile: |
+          // Private album API. One function behind /api/*.
+          // Rows live in one table: pk = ALBUM (photos), SET (albums), COMMENT, NOTE, HEART, DATE, PRESENCE, NOTIFY.
+          // A deleted photo goes to a bin, can be restored for 30 days, and is erased for good after that.
+          const { DynamoDBClient, QueryCommand, PutItemCommand, UpdateItemCommand, DeleteItemCommand } = require("@aws-sdk/client-dynamodb");
+          const { S3Client, PutObjectCommand, ListObjectsV2Command, ListObjectVersionsCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+          const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+          const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
+          const crypto = require("crypto");
+
+          const db = new DynamoDBClient({});
+          const s3 = new S3Client({});
+          const sns = new SNSClient({});
+          const { TABLE, MEDIA_BUCKET, ORIGIN_SECRET, TOPIC_ONE, TOPIC_TWO } = process.env;
+          const BIN_DAYS = 30;
+          const LOVE_PER_DAY = 1000;                           // most hearts one person can send in a UK day
+          const ukDay = (d) => new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/London" }).format(new Date(d));
+          const PRINT = /^[iv]:[0-9a-f]{16,64}:\d{1,12}$/;      // fingerprint used to spot the same photo or film twice
+          const TOPICS = { one: TOPIC_ONE, two: TOPIC_TWO };
+          const GAP_MS = Number(process.env.EMAIL_GAP_MINUTES || 60) * 60000;
+          const WHEN = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$/;
+          const PEOPLE = ["one", "two"];                      // must match the ids in site/app.js
+
+          const json = (code, body) => ({ statusCode: code, headers: { "content-type": "application/json", "cache-control": "no-store" }, body: JSON.stringify(body) });
+          const S = (v) => ({ S: String(v) });
+          const plain = (item) => Object.fromEntries(Object.entries(item).map(([k, v]) => [k, v.S !== undefined ? v.S : ""]));
+          const person = (v) => (PEOPLE.includes(v) ? v : null);
+          const text = (v, max) => (typeof v === "string" && v.trim() && v.trim().length <= max ? v.trim() : null);
+
+          async function rows(pk) {
+            const out = []; let start;
+            do {
+              const r = await db.send(new QueryCommand({ TableName: TABLE, KeyConditionExpression: "pk = :p", ExpressionAttributeValues: { ":p": S(pk) }, ExclusiveStartKey: start }));
+              out.push(...(r.Items || []).map(plain)); start = r.LastEvaluatedKey;
+            } while (start);
+            return out;
+          }
+          async function storedKeys() {
+            const keys = new Set(); let token;
+            do {
+              const r = await s3.send(new ListObjectsV2Command({ Bucket: MEDIA_BUCKET, Prefix: "uploads/", ContinuationToken: token }));
+              (r.Contents || []).forEach((o) => keys.add(o.Key)); token = r.IsTruncated ? r.NextContinuationToken : undefined;
+            } while (token);
+            return keys;
+          }
+          // One short, nameless email to the other person, at most once per gap.
+          async function notify(from, kind) {
+            try {
+              const to = PEOPLE.find((p) => p !== from), topic = TOPICS[to];
+              if (!person(from) || !topic) return;
+              const last = (await rows("NOTIFY")).find((r) => r.sk === to);
+              if (last && Date.now() - new Date(last.lastAt).getTime() < GAP_MS) return;
+              const line = kind === "upload" ? "There is a new upload waiting for you." : "There is a new message waiting for you.";
+              await sns.send(new PublishCommand({ TopicArn: topic, Subject: line.slice(0, -1), Message: line }));
+              await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: S("NOTIFY"), sk: S(to), lastAt: S(new Date().toISOString()) } }));
+            } catch (err) { console.error("notify failed", err); }
+          }
+          async function setFields(pk, sk, fields) {
+            const names = {}, values = {}, parts = [];
+            Object.entries(fields).forEach(([k, v], i) => { names["#f" + i] = k; values[":v" + i] = S(v); parts.push(`#f${i} = :v${i}`); });
+            await db.send(new UpdateItemCommand({ TableName: TABLE, Key: { pk: S(pk), sk: S(sk) }, UpdateExpression: "SET " + parts.join(", "),
+              ConditionExpression: "attribute_exists(pk)", ExpressionAttributeNames: names, ExpressionAttributeValues: values }));
+          }
+          const mediaUrl = (key) => "/media/" + key.split("/").map(encodeURIComponent).join("/");
+
+          const shape = (i) => ({
+            id: i.sk, key: i.key, url: mediaUrl(i.key), caption: i.caption || "", createdAt: i.createdAt, takenAt: i.takenAt || "", album: i.album || "",
+            contentType: i.contentType, type: i.type || ((i.contentType || "").startsWith("video") ? "video" : "image"), uploadedBy: i.uploadedBy || "", print: i.print || "",
+          });
+          const binAge = (i) => (Date.now() - new Date(i.deletedAt).getTime()) / 86400000;
+
+          // Erase a binned photo for good: every stored version of the file, its row, comments and hearts.
+          async function erase(i) {
+            let more = true, keyMarker, versionMarker;
+            while (more) {
+              const r = await s3.send(new ListObjectVersionsCommand({ Bucket: MEDIA_BUCKET, Prefix: i.key, KeyMarker: keyMarker, VersionIdMarker: versionMarker }));
+              for (const v of [...(r.Versions || []), ...(r.DeleteMarkers || [])]) {
+                if (v.Key === i.key) await s3.send(new DeleteObjectCommand({ Bucket: MEDIA_BUCKET, Key: i.key, VersionId: v.VersionId }));
+              }
+              more = !!r.IsTruncated; keyMarker = r.NextKeyMarker; versionMarker = r.NextVersionIdMarker;
+            }
+            for (const c of (await rows("COMMENT")).filter((c) => c.key === i.key)) await db.send(new DeleteItemCommand({ TableName: TABLE, Key: { pk: S("COMMENT"), sk: S(c.sk) } }));
+            for (const h of (await rows("HEART")).filter((h) => h.photo === i.sk)) await db.send(new DeleteItemCommand({ TableName: TABLE, Key: { pk: S("HEART"), sk: S(h.sk) } }));
+            await db.send(new DeleteItemCommand({ TableName: TABLE, Key: { pk: S("ALBUM"), sk: S(i.sk) } }));
+          }
+          async function sweep(items) {
+            for (const i of items.filter((i) => i.deletedAt && binAge(i) >= BIN_DAYS)) {
+              try { await erase(i); } catch (err) { console.error("erase failed", i.key, err); }
+            }
+          }
+          async function remove(b) {
+            if (typeof b.id !== "string") return json(400, { error: "id is required." });
+            await setFields("ALBUM", b.id, { deletedAt: new Date().toISOString(), deletedBy: person(b.who) || "" });
+            return json(200, { ok: true });
+          }
+          async function bin() {
+            const items = (await rows("ALBUM")).filter((i) => i.deletedAt && binAge(i) < BIN_DAYS);
+            return json(200, { items: items.map((i) => ({ ...shape(i), deletedAt: i.deletedAt, deletedBy: i.deletedBy || "", daysLeft: Math.max(1, Math.ceil(BIN_DAYS - binAge(i))) })) });
+          }
+          async function restore(b) {
+            if (typeof b.id !== "string") return json(400, { error: "id is required." });
+            await setFields("ALBUM", b.id, { deletedAt: "", deletedBy: "" });
+            return json(200, { ok: true });
+          }
+
+          async function list() {
+            const [items, keys] = await Promise.all([rows("ALBUM"), storedKeys()]);
+            await sweep(items);
+            return json(200, { items: items.filter((i) => keys.has(i.key) && !i.deletedAt).map(shape) });
+          }
+          async function upload(b) {
+            const contentType = typeof b.contentType === "string" && /^(image|video)\//.test(b.contentType) ? b.contentType : null;
+            if (!contentType) return json(400, { error: "Only photos and videos can be added." });
+            const id = crypto.randomUUID(), now = new Date().toISOString();
+            const safe = String(b.fileName || "file").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
+            const key = `uploads/${now.slice(0, 4)}/${now.slice(5, 7)}/${id}-${safe}`;
+            const uploadUrl = await getSignedUrl(s3, new PutObjectCommand({ Bucket: MEDIA_BUCKET, Key: key, ContentType: contentType }), { expiresIn: 300 });
+            const Item = { pk: S("ALBUM"), sk: S(`TS#${now}#${id}`), key: S(key), contentType: S(contentType), type: S(contentType.startsWith("video") ? "video" : "image"),
+              caption: S(String(b.caption || "").slice(0, 200)), createdAt: S(now) };
+            if (person(b.uploadedBy)) Item.uploadedBy = S(b.uploadedBy);
+            if (typeof b.takenAt === "string" && WHEN.test(b.takenAt)) Item.takenAt = S(b.takenAt);
+            if (typeof b.album === "string" && b.album) Item.album = S(b.album.slice(0, 120));
+            if (typeof b.print === "string" && PRINT.test(b.print)) Item.print = S(b.print);
+            await db.send(new PutItemCommand({ TableName: TABLE, Item }));
+            await notify(b.uploadedBy, "upload");
+            return json(200, { uploadUrl, key });
+          }
+          // Edit a photo's caption, date taken or album.
+          async function details(b) {
+            if (typeof b.id !== "string") return json(400, { error: "id is required." });
+            const f = {};
+            if (typeof b.caption === "string") f.caption = b.caption.trim().slice(0, 200);
+            if (typeof b.takenAt === "string" && (b.takenAt === "" || WHEN.test(b.takenAt))) f.takenAt = b.takenAt;
+            if (typeof b.album === "string") f.album = b.album.slice(0, 120);
+            if (typeof b.print === "string" && PRINT.test(b.print)) f.print = b.print;
+            if (!Object.keys(f).length) return json(400, { error: "Nothing to change." });
+            await setFields("ALBUM", b.id, f);
+            return json(200, { ok: true });
+          }
+          async function albums(method, b) {
+            if (method === "GET") return json(200, { albums: (await rows("SET")).map((r) => ({ id: r.sk, name: r.name, createdAt: r.createdAt })) });
+            const name = text(b.name, 60);
+            if (!name) return json(400, { error: "name is required." });
+            if (typeof b.id === "string" && b.id) { await setFields("SET", b.id, { name }); return json(200, { album: { id: b.id, name } }); }
+            const now = new Date().toISOString(), sk = `TS#${now}#${crypto.randomUUID()}`;
+            await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: S("SET"), sk: S(sk), name: S(name), createdAt: S(now) } }));
+            return json(200, { album: { id: sk, name, createdAt: now } });
+          }
+          async function hearts(method, b) {
+            if (method === "GET") return json(200, { hearts: (await rows("HEART")).map((r) => ({ id: r.photo, who: r.who })) });
+            if (typeof b.id !== "string" || !person(b.who)) return json(400, { error: "id and who are required." });
+            const Key = { pk: S("HEART"), sk: S(`${b.who}|${b.id}`) };
+            if (b.on) await db.send(new PutItemCommand({ TableName: TABLE, Item: { ...Key, photo: S(b.id), who: S(b.who) } }));
+            else await db.send(new DeleteItemCommand({ TableName: TABLE, Key }));
+            return json(200, { ok: true });
+          }
+          async function dates(method, b, q) {
+            if (method === "GET") return json(200, { dates: (await rows("DATE")).map((r) => ({ id: r.sk, title: r.title, date: r.date, yearly: r.yearly === "1" })) });
+            if (method === "DELETE") {
+              if (!q.id) return json(400, { error: "id is required." });
+              await db.send(new DeleteItemCommand({ TableName: TABLE, Key: { pk: S("DATE"), sk: S(q.id) } }));
+              return json(200, { ok: true });
+            }
+            const title = text(b.title, 80);
+            if (!title || typeof b.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.date)) return json(400, { error: "title and date are required." });
+            const sk = crypto.randomUUID();
+            await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: S("DATE"), sk: S(sk), title: S(title), date: S(b.date), yearly: S(b.yearly ? "1" : "0") } }));
+            return json(200, { date: { id: sk, title, date: b.date, yearly: !!b.yearly } });
+          }
+          // Comments and notes share one shape.
+          async function thread(pk, name, method, b, q) {
+            if (method === "GET") {
+              const all = await rows(pk);
+              return json(200, { [name + "s"]: all.map((r) => ({ id: r.sk, key: r.key || undefined, author: r.author, text: r.text, createdAt: r.createdAt })) });
+            }
+            if (method === "DELETE") {
+              if (!q.id) return json(400, { error: "id is required." });
+              await db.send(new DeleteItemCommand({ TableName: TABLE, Key: { pk: S(pk), sk: S(q.id) } }));
+              return json(200, { ok: true });
+            }
+            const author = person(b.author), body = text(b.text, 1000);
+            if (!author || !body) return json(400, { error: "author and text are required." });
+            if (pk === "COMMENT" && typeof b.key !== "string") return json(400, { error: "key is required." });
+            const now = new Date().toISOString(), sk = `TS#${now}#${crypto.randomUUID()}`;
+            const Item = { pk: S(pk), sk: S(sk), author: S(author), text: S(body), createdAt: S(now) };
+            if (pk === "COMMENT") Item.key = S(b.key);
+            await db.send(new PutItemCommand({ TableName: TABLE, Item }));
+            await notify(author, "message");
+            return json(200, { [name]: { id: sk, key: b.key, author, text: body, createdAt: now } });
+          }
+          // Hearts sent to each other. No email goes out for these.
+          async function love(method, path, b) {
+            const all = await rows("LOVE");
+            const out = (r) => ({ id: r.sk, from: r.from, count: Number(r.count) || 0, text: r.text || "", createdAt: r.createdAt, seen: r.seen === "1" });
+            if (method === "GET") return json(200, { sends: all.map(out), perDay: LOVE_PER_DAY });
+            if (path === "/love/seen") {
+              if (!person(b.who)) return json(400, { error: "who is required." });
+              for (const r of all.filter((r) => r.from !== b.who && r.seen !== "1")) await setFields("LOVE", r.sk, { seen: "1" });
+              return json(200, { ok: true });
+            }
+            const from = person(b.from), count = Number(b.count);
+            if (!from || !Number.isInteger(count) || count < 1) return json(400, { error: "from and a whole number of hearts are required." });
+            const today = ukDay(Date.now());
+            const used = all.filter((r) => r.from === from && ukDay(r.createdAt) === today).reduce((n, r) => n + (Number(r.count) || 0), 0);
+            const left = Math.max(0, LOVE_PER_DAY - used);
+            if (count > left) return json(429, { error: "Daily limit reached.", remaining: left });
+            const now = new Date().toISOString(), sk = `TS#${now}#${crypto.randomUUID()}`;
+            const note = typeof b.text === "string" ? b.text.trim().slice(0, 200) : "";
+            await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: S("LOVE"), sk: S(sk), from: S(from), count: S(count), text: S(note), createdAt: S(now), seen: S("0") } }));
+            return json(200, { send: { id: sk, from, count, text: note, createdAt: now, seen: false }, remaining: left - count });
+          }
+          async function presence(method, b) {
+            const seen = Object.fromEntries((await rows("PRESENCE")).map((r) => [r.sk, r.lastSeen]));
+            if (method === "POST" && person(b.who)) {
+              const now = new Date().toISOString();
+              await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: S("PRESENCE"), sk: S(b.who), lastSeen: S(now) } }));
+              seen[b.who] = now;
+            }
+            return json(200, { presence: seen });
+          }
+
+          exports.handler = async (event) => {
+            try {
+              if (ORIGIN_SECRET && (event.headers || {})["x-origin-secret"] !== ORIGIN_SECRET) return json(403, { error: "Forbidden" });
+              const method = event.requestContext.http.method;
+              const path = (event.rawPath || "").replace(/^\/api/, "").replace(/\/$/, "");
+              const q = event.queryStringParameters || {};
+              let b = {};
+              if (event.body) { try { b = JSON.parse(event.isBase64Encoded ? Buffer.from(event.body, "base64").toString() : event.body) || {}; } catch { return json(400, { error: "Body must be JSON." }); } }
+
+              if (path === "/list" && method === "GET") return await list();
+              if (path === "/upload" && method === "POST") return await upload(b);
+              if (path === "/details" && method === "POST") return await details(b);
+              if (path === "/delete" && method === "POST") return await remove(b);
+              if (path === "/bin" && method === "GET") return await bin();
+              if (path === "/restore" && method === "POST") return await restore(b);
+              if (path === "/albums" && (method === "GET" || method === "POST")) return await albums(method, b);
+              if (path === "/hearts" && (method === "GET" || method === "POST")) return await hearts(method, b);
+              if (path === "/dates") return await dates(method, b, q);
+              if (path === "/comments") return await thread("COMMENT", "comment", method, b, q);
+              if (path === "/messages") return await thread("NOTE", "message", method, b, q);
+              if (path === "/presence") return await presence(method, b);
+              if ((path === "/love" && (method === "GET" || method === "POST")) || (path === "/love/seen" && method === "POST")) return await love(method, path, b);
+              return json(404, { error: "Not found" });
+            } catch (err) {
+              console.error(err);
+              if (err && err.name === "ConditionalCheckFailedException") return json(404, { error: "Not found" });
+              return json(500, { error: "Something went wrong." });
+            }
+          };
+
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ApiFunction}"
+      RetentionInDays: 30
+
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: $default
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+
+  # Sign-in at the edge. Also maps /media/<key> to the object <key> in the media bucket.
+  AuthFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-auth"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Basic sign-in for the album
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub
+        - |
+          function handler(event) {
+            var request = event.request;
+            var auth = request.headers.authorization;
+            if (!auth || auth.value !== 'Basic ${Token}') {
+              return {
+                statusCode: 401,
+                statusDescription: 'Unauthorized',
+                headers: { 'www-authenticate': { value: 'Basic realm="Album", charset="UTF-8"' } }
+              };
+            }
+            if (request.uri.indexOf('/media/') === 0) {
+              request.uri = request.uri.substring(6);
+            }
+            return request;
+          }
+        - Token:
+            Fn::Base64: !Sub "${SiteUsername}:${SitePassword}"
+
+  OriginAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-s3"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Private album
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+        DefaultRootObject: index.html
+        Aliases: !If
+          - UseDomain
+          - [!Ref DomainName, !Sub "www.${DomainName}"]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - UseDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccess
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: media
+            DomainName: !Sub "${MediaBucketName}.s3.${AWS::Region}.amazonaws.com"
+            OriginAccessControlId: !Ref OriginAccess
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api
+            DomainName: !Sub "${Api}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+            OriginCustomHeaders:
+              - HeaderName: x-origin-secret
+                HeaderValue: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # CachingDisabled, so site updates show at once
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt AuthFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # AllViewerExceptHostHeader
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt AuthFunction.FunctionMetadata.FunctionARN
+          - PathPattern: /media/*
+            TargetOriginId: media
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt AuthFunction.FunctionMetadata.FunctionARN
+
+Outputs:
+  SiteBucketName:
+    Description: Upload the site files here.
+    Value: !Ref SiteBucket
+  TestAddress:
+    Description: The album's cloudfront.net address. Point DNS here at cutover.
+    Value: !Sub "https://${Distribution.DomainName}"
+  DistributionId:
+    Value: !Ref Distribution
+
